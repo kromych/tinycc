@@ -2582,9 +2582,40 @@ static void update_reloc_sections(TCCState *s1, struct dyn_inf *dyninf)
 }
 #endif /* ndef ELF_OBJ_ONLY */
 
+typedef struct
+{
+    uint8_t *buf;
+    size_t count;
+    size_t allocated;
+} ElfOutput;
+
+static void elf_write(ElfOutput *out, const void *buf, size_t size)
+{
+    if (!size) return;
+    if (out->count + size > out->allocated) {
+        size_t new_alloc = out->allocated == 0 ? 4096 : out->allocated * 2;
+        while (out->count + size > new_alloc) 
+            new_alloc *= 2;
+        out->buf = tcc_realloc(out->buf, new_alloc);
+    }
+    memcpy(out->buf + out->count, buf, size);
+    out->count += size;
+}
+
+static void elf_pad(ElfOutput *out, size_t target_offset)
+{
+    static const uint8_t zeros[4096] = {0};
+    while (out->count < target_offset) {
+        size_t n = target_offset - out->count;
+        if (n > sizeof(zeros)) 
+            n = sizeof(zeros);
+        elf_write(out, zeros, n);
+    }
+}
+
 /* Create an ELF file on disk.
    This function handle ELF specific layout requirements */
-static int tcc_output_elf(TCCState *s1, FILE *f, int phnum, ElfW(Phdr) *phdr)
+static int tcc_output_elf(TCCState *s1, ElfOutput *out, int phnum, ElfW(Phdr) *phdr)
 {
     int i, shnum, offset, size, file_type;
     Section *s;
@@ -2654,15 +2685,12 @@ static int tcc_output_elf(TCCState *s1, FILE *f, int phnum, ElfW(Phdr) *phdr)
     ehdr.e_shnum = shnum;
     ehdr.e_shstrndx = shnum - 1;
 
-    offset = fwrite(&ehdr, 1, sizeof(ElfW(Ehdr)), f);
+    elf_write(out, &ehdr, sizeof(ElfW(Ehdr)));
     if (phdr)
-        offset += fwrite(phdr, 1, phnum * sizeof(ElfW(Phdr)), f);
+        elf_write(out, phdr, phnum * sizeof(ElfW(Phdr)));
 
-    /* output section headers */
-    while (offset < ehdr.e_shoff) {
-        fputc(0, f);
-        offset++;
-    }
+    /* Pad and output section headers */
+    elf_pad(out, ehdr.e_shoff);
 
     for(i = 0; i < shnum; i++) {
         sh = &shdr;
@@ -2681,77 +2709,103 @@ static int tcc_output_elf(TCCState *s1, FILE *f, int phnum, ElfW(Phdr) *phdr)
             sh->sh_offset = s->sh_offset;
             sh->sh_size = s->sh_size;
         }
-        offset += fwrite(sh, 1, sizeof(ElfW(Shdr)), f);
+        elf_write(out, sh, sizeof(ElfW(Shdr)));
     }
 
     /* output sections */
     for(i = 1; i < s1->nb_sections; i++) {
         s = s1->sections[i];
         if (s->sh_type != SHT_NOBITS) {
-            while (offset < s->sh_offset) {
-                fputc(0, f);
-                offset++;
-            }
-            size = s->sh_size;
-            if (size)
-                offset += fwrite(s->data, 1, size, f);
+            elf_pad(out, s->sh_offset);
+            if (s->sh_size)
+                elf_write(out, s->data, s->sh_size);
         }
     }
     return 0;
 }
 
-static int tcc_output_binary(TCCState *s1, FILE *f)
+static int tcc_output_binary(TCCState *s1, ElfOutput *out)
 {
     Section *s;
-    int i, offset, size;
+    int i;
 
-    offset = 0;
-    for(i=1;i<s1->nb_sections;i++) {
+    for(i=1; i<s1->nb_sections; ++i) {
         s = s1->sections[i];
         if (s->sh_type != SHT_NOBITS &&
             (s->sh_flags & SHF_ALLOC)) {
-            while (offset < s->sh_offset) {
-                fputc(0, f);
-                offset++;
-            }
-            size = s->sh_size;
-            fwrite(s->data, 1, size, f);
-            offset += size;
+            elf_pad(out, s->sh_offset);
+            if (s->sh_size)
+                elf_write(out, s->data, s->sh_size);
         }
     }
     return 0;
 }
 
-/* Write an elf, coff or "binary" file */
+/* Write an elf, coff or "binary" file.
+   Always outputs to memory. Saves to file only if filename is provided.
+   Returns the pointer to the buffer in pbuf and the size in psize
+   if these are provided. If they are, the caller should free the memory.
+*/
 static int tcc_write_elf_file(TCCState *s1, const char *filename, int phnum,
-                              ElfW(Phdr) *phdr)
+                              ElfW(Phdr) *phdr, void **pbuf, size_t *psize)
 {
-    int fd, mode, file_type, ret;
+    int fd, mode, ret;
     FILE *f;
+    ElfOutput out = {0};
 
-    file_type = s1->output_type;
-    if (file_type == TCC_OUTPUT_OBJ)
-        mode = 0666;
-    else
-        mode = 0777;
-    unlink(filename);
-    fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, mode);
-    if (fd < 0 || (f = fdopen(fd, "wb")) == NULL)
-        return tcc_error_noabort("could not write '%s: %s'", filename, strerror(errno));
-    if (s1->verbose)
-        printf("<- %s\n", filename);
+    /* TODO: Handle COFF format directly for now if needed (not yet abstracted) */
 #ifdef TCC_TARGET_COFF
-    if (s1->output_format == TCC_OUTPUT_FORMAT_COFF)
+    if (s1->output_format == TCC_OUTPUT_FORMAT_COFF) {
+        if (!filename) return -1; 
+        mode = (s1->output_type == TCC_OUTPUT_OBJ) ? 0666 : 0777;
+        unlink(filename);
+        fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, mode);
+        if (fd < 0 || (f = fdopen(fd, "wb")) == NULL)
+            return tcc_error_noabort("could not write '%s: %s'", filename, strerror(errno));
+        if (s1->verbose) printf("<- %s\n", filename);
         tcc_output_coff(s1, f);
-    else
+        fclose(f);
+        return 0;
+    }
 #endif
-    if (s1->output_format == TCC_OUTPUT_FORMAT_ELF)
-        ret = tcc_output_elf(s1, f, phnum, phdr);
-    else
-        ret = tcc_output_binary(s1, f);
-    fclose(f);
 
-    return ret;
+    /* Always build the image in memory first */
+    if (s1->output_format == TCC_OUTPUT_FORMAT_ELF)
+        ret = tcc_output_elf(s1, &out, phnum, phdr);
+    else
+        ret = tcc_output_binary(s1, &out);
+
+    if (ret < 0) {
+        tcc_free(out.buf);
+        if (pbuf) *pbuf = NULL;
+        if (psize) *psize = 0;
+        return ret;
+    }
+
+    /* Optional file save if the filename is provided */
+    if (filename) {
+        mode = (s1->output_type == TCC_OUTPUT_OBJ) ? 0666 : 0777;
+        unlink(filename);
+        fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, mode);
+        if (fd < 0 || (f = fdopen(fd, "wb")) == NULL) {
+            tcc_free(out.buf);
+            return tcc_error_noabort("could not write '%s: %s'", filename, strerror(errno));
+        }
+        if (s1->verbose)
+            printf("<- %s\n", filename);
+        fwrite(out.buf, 1, out.count, f);
+        fclose(f);
+    }
+
+    /* Return buffer to caller or clean it up if not requested */
+    if (pbuf && psize) {
+        *pbuf = out.buf;
+        *psize = out.count;
+    } else {
+        tcc_free(out.buf);
+    }
+
+    return 0;
 }
 
 #ifndef ELF_OBJ_ONLY
@@ -2895,7 +2949,7 @@ static void alloc_sec_names(TCCState *s1, int is_obj);
 
 /* Output an elf, coff or binary file */
 /* XXX: suppress unneeded sections */
-static int elf_output_file(TCCState *s1, const char *filename)
+static int elf_output_file(TCCState *s1, const char *filename, void **pbuf, size_t *psize)
 {
     int i, ret, file_type, *sec_order;
     struct dyn_inf dyninf = {0};
@@ -3068,8 +3122,8 @@ static int elf_output_file(TCCState *s1, const char *filename)
     /* fill with final data */
     tcc_eh_frame_hdr(s1, 1);
 #endif
-    /* Create the ELF file with name 'filename' */
-    ret = tcc_write_elf_file(s1, filename, dyninf.phnum, dyninf.phdr);
+    /* Create the ELF file with name 'filename' (if supplied) */
+    ret = tcc_write_elf_file(s1, filename, dyninf.phnum, dyninf.phdr, pbuf, psize);
  the_end:
     tcc_free(sec_order);
     tcc_free(dyninf.phdr);
@@ -3096,7 +3150,7 @@ static void alloc_sec_names(TCCState *s1, int is_obj)
 }
 
 /* Output an elf .o file */
-LIBTCCAPI int elf_output_obj(TCCState *s1, const char *filename)
+LIBTCCAPI int elf_output_obj(TCCState *s1, const char *filename, void **pbuf, size_t *psize)
 {
     Section *s;
     int i, ret, file_offset;
@@ -3111,8 +3165,8 @@ LIBTCCAPI int elf_output_obj(TCCState *s1, const char *filename)
         if (s->sh_type != SHT_NOBITS)
             file_offset += s->sh_size;
     }
-    /* Create the ELF file with name 'filename' */
-    ret = tcc_write_elf_file(s1, filename, 0, NULL);
+    /* Create the ELF file with name 'filename' (if given)*/
+    ret = tcc_write_elf_file(s1, filename, 0, NULL, pbuf, psize);
     return ret;
 }
 
@@ -3122,13 +3176,31 @@ LIBTCCAPI int tcc_output_file(TCCState *s, const char *filename)
     if (s->test_coverage)
         tcc_tcov_add_file(s, filename);
     if (s->output_type == TCC_OUTPUT_OBJ)
-        return elf_output_obj(s, filename);
+        return elf_output_obj(s, filename, NULL, NULL);
 #ifdef TCC_TARGET_PE
     return  pe_output_file(s, filename);
 #elif defined TCC_TARGET_MACHO
     return macho_output_file(s, filename);
 #else
-    return elf_output_file(s, filename);
+    return elf_output_file(s, filename, NULL, NULL);
+#endif
+}
+
+/* Build the final output entirely in memory and return it.
+   The returned buffer in *pbuf must be freed using tcc_free(). */
+LIBTCCAPI int tcc_output_memory(TCCState *s, void **pbuf, size_t *psize)
+{
+    s->nb_errors = 0;
+    if (s->output_type == TCC_OUTPUT_OBJ)
+        return elf_output_obj(s, NULL, pbuf, psize);
+#ifdef TCC_TARGET_PE
+    /* TODO */
+    return -1; 
+#elif defined TCC_TARGET_MACHO
+    /* TODO */
+    return -1;
+#else
+    return elf_output_file(s, NULL, pbuf, psize);
 #endif
 }
 

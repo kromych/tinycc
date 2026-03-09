@@ -115,7 +115,11 @@ LIBTCCAPI int tcc_compile_string_file(TCCState *s, const char *buf, const char *
 /* Output object file. This must be done after tcc_relocate.
    It only generates the file if debug is set.
    The filename can be loaded with gdb command add-symbol-file */
-LIBTCCAPI int elf_output_obj(TCCState *s1, const char *filename);
+LIBTCCAPI int elf_output_obj(TCCState *s1, const char *filename, void **pbuf, size_t *psize);
+
+/* Build the final output entirely in memory and return it.
+   The returned buffer in *pbuf must be freed using tcc_free(). */
+LIBTCCAPI int tcc_output_memory(TCCState *s, void **pbuf, size_t *psize);
 
 /* custom error printer for runtime exceptions. Returning 0 stops backtrace */
 typedef int TCCBtFunc(void *udata, void *pc, const char *file, int line, const char* func, const char *msg);

@@ -47,7 +47,7 @@ main(void)
 	return 1;
     if (tcc_relocate(s) < 0)
         return 1;
-    elf_output_obj(s, "tst.o");
+    elf_output_obj(s, "tst.o", NULL, NULL);
     /* set breakpoint on next line. and load symbol file with
        gdb command add-symbol-file.
        Then set breakpoint on tst and continue. */
